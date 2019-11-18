@@ -38,6 +38,14 @@
 #include "algorithm/pluck.h"
 #include "algorithm/yescrypt.h"
 #include "algorithm/lyra2rev2.h"
+#include "algorithm/lyra2rev3.h"
+#include "algorithm/lyra2Z.h"
+#include "algorithm/lyra2Zz.h"
+#include "algorithm/lyra2h.h"
+#include "algorithm/phi2.h"
+#include "algorithm/x22i.h"
+#include "algorithm/x25x.h"
+#include "algorithm/argon2d/argon2d.h"
 
 /* FIXME: only here for global config vars, replace with configuration.h
  * or similar as soon as config is in a struct instead of littered all
@@ -331,6 +339,13 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize, algorithm_t *alg
     cgpu->lookup_gap = 2;
   }
 
+  //Set the default threads/throughput based on available memory and number of running threads on the GPU
+  if (strcmp(cgpu->algorithm.name, "argon2d") == 0) {
+      cgpu->throughput = ((cgpu->max_alloc * 80 / 100) / cgpu->threads) / AR2D_MEM_PER_BATCH;
+      if (cgpu->intensity > 0)
+          cgpu->throughput = cgpu->intensity * 1000;
+  }
+
   // neoscrypt TC
   if (cgpu->algorithm.type == ALGO_NEOSCRYPT && !cgpu->opt_tc) {
     size_t glob_thread_count;
@@ -586,16 +601,32 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize, algorithm_t *alg
   }
 
   // Lyra2re v2 TC
-  else if ((cgpu->algorithm.type == ALGO_LYRA2REV2 || cgpu->algorithm.type == ALGO_PHI2) && !cgpu->opt_tc) {
+  else if ((cgpu->algorithm.type == ALGO_LYRA2REV2 ||
+            cgpu->algorithm.type == ALGO_LYRA2REV3 ||
+            cgpu->algorithm.type == ALGO_X22I ||
+            cgpu->algorithm.type == ALGO_X25X ||
+            cgpu->algorithm.type == ALGO_LYRA2Z ||
+            cgpu->algorithm.type == ALGO_LYRA2ZZ ||
+            cgpu->algorithm.type == ALGO_LYRA2H ||
+            cgpu->algorithm.type == ALGO_PHI2 ||
+            cgpu->algorithm.type == ALGO_ALLIUM) && !cgpu->opt_tc) {
     size_t glob_thread_count;
     long max_int;
     unsigned char type = 0;
 
     size_t scratchbuf_size;
-    if (cgpu->algorithm.type == ALGO_LYRA2REV2) {
+    if (cgpu->algorithm.type == ALGO_LYRA2REV2 || cgpu->algorithm.type == ALGO_LYRA2REV3) {
       scratchbuf_size = LYRA_SCRATCHBUF_SIZE;
-    } else {
-      scratchbuf_size = LYRA2Z_SCRATCHBUF_SIZE;
+    } else if (cgpu->algorithm.type == ALGO_LYRA2Z || cgpu->algorithm.type == ALGO_LYRA2ZZ || cgpu->algorithm.type == ALGO_ALLIUM) {
+      scratchbuf_size = PHI2_SCRATCHBUF_SIZE / 2; // LYRA2Z_SCRATCHBUF_SIZE * 8;
+    } else if (cgpu->algorithm.type == ALGO_LYRA2H) {
+      scratchbuf_size = LYRA2H_SCRATCHBUF_SIZE;
+    } else if (cgpu->algorithm.type == ALGO_X22I) {
+      scratchbuf_size = X22I_SCRATCHBUF_SIZE;
+    } else if (cgpu->algorithm.type == ALGO_X25X) {
+      scratchbuf_size = X25X_SCRATCHBUF_SIZE;
+    } else { // PHI2
+      scratchbuf_size = PHI2_SCRATCHBUF_SIZE;
     }
 
     // determine which intensity type to use
@@ -731,12 +762,53 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize, algorithm_t *alg
 
 	// If it doesn't work, oh well, build it again next run
     save_opencl_kernel(build_data, clState->program);
+  } else {
+    if (build_data->prebuilt) {
+      clState->prebuilt = true;
+    }
   }
 
   // Load kernels
   applog(LOG_NOTICE, "Initialising kernel %s with nfactor %d, n %d",
     filename, algorithm->nfactor, algorithm->n);
 
+if (algorithm->type == ALGO_MTP) {
+	  clState->mtp_0 = clCreateKernel(clState->program, "mtp_i", &status);
+	  if (status != CL_SUCCESS) {
+		  applog(LOG_ERR, "Error %d: Creating Kernel \"mtp_i\" from program. (clCreateKernel)", status);
+		  return NULL;
+	  }
+	  clState->mtp_1 = clCreateKernel(clState->program, "mtp_i", &status);
+	  if (status != CL_SUCCESS) {
+		  applog(LOG_ERR, "Error %d: Creating Kernel \"mtp_i\" from program. (clCreateKernel)", status);
+		  return NULL;
+	  }
+	  clState->mtp_2 = clCreateKernel(clState->program, "mtp_i", &status);
+	  if (status != CL_SUCCESS) {
+		  applog(LOG_ERR, "Error %d: Creating Kernel \"mtp_i\" from program. (clCreateKernel)", status);
+		  return NULL;
+	  }
+	  clState->mtp_3 = clCreateKernel(clState->program, "mtp_i", &status);
+	  if (status != CL_SUCCESS) {
+		  applog(LOG_ERR, "Error %d: Creating Kernel \"mtp_i\" from program. (clCreateKernel)", status);
+		  return NULL;
+	  }
+	  clState->mtp_fc = clCreateKernel(clState->program, "mtp_fc", &status);
+	  if (status != CL_SUCCESS) {
+		  applog(LOG_ERR, "Error %d: Creating Kernel \"mtp_fc\" from program. (clCreateKernel)", status);
+		  return NULL;
+	  }
+	  clState->mtp_yloop = clCreateKernel(clState->program, "mtp_yloop", &status);
+	  if (status != CL_SUCCESS) {
+		  applog(LOG_ERR, "Error %d: Creating Kernel \"mtp_yloop\" from program. (clCreateKernel)", status);
+		  return NULL;
+	  }
+
+//	  clState->devid = cgpu->device_id;
+//	  return clState;
+  }
+/// default
+	else {
   /* get a kernel object handle for a kernel with the given name */
   clState->kernel = clCreateKernel(clState->program, "search", &status);
   if (status != CL_SUCCESS) {
@@ -760,16 +832,29 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize, algorithm_t *alg
       }
     }
   }
+  }
+
+  if (algorithm->type == ALGO_ETHASH) {
+    clState->GenerateDAG = clCreateKernel(clState->program, "GenerateDAG", &status);
+
+    if (status != CL_SUCCESS) {
+      applog(LOG_ERR, "Error %d while creating DAG generation kernel.", status);
+      return NULL;
+    }
+  }
 
   size_t bufsize;
   size_t buf1size;
   size_t buf3size;
   size_t buf2size;
+  size_t buf4size;
+  size_t buf5size;
   size_t readbufsize = 128;
   if (algorithm->type == ALGO_CRE) readbufsize = 168;
   else if (algorithm->type == ALGO_DECRED) readbufsize = 192;
   else if (algorithm->type == ALGO_LBRY) readbufsize = 112;
   else if (algorithm->type == ALGO_PASCAL) readbufsize = 196;
+  else if (algorithm->type == ALGO_ETHASH) readbufsize = 32;
 
   if (algorithm->rw_buffer_size < 0) {
     // calc buffer size for neoscrypt
@@ -808,17 +893,30 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize, algorithm_t *alg
       applog(LOG_DEBUG, "yescrypt buffer sizes: %lu RW, %lu R", (unsigned long)bufsize, (unsigned long)readbufsize);
       // scrypt/n-scrypt
     }
-    else if (algorithm->type == ALGO_LYRA2REV2) {
-      /* The scratch/pad-buffer needs 32kBytes memory per thread. */
-      bufsize = LYRA_SCRATCHBUF_SIZE * cgpu->thread_concurrency;
-      buf1size = 4* 8 * cgpu->thread_concurrency; //matrix
+    else if (algorithm->type == ALGO_LYRA2REV2 || algorithm->type == ALGO_LYRA2REV3) {
+      bufsize = 8 * 4 * cgpu->thread_concurrency;
+      buf1size = 4 * 8 * 4 * cgpu->thread_concurrency; // state
 
       /* This is the input buffer. For yescrypt this is guaranteed to be
       * 80 bytes only. */
       readbufsize = 80;
 
-      applog(LOG_DEBUG, "lyra2REv2 buffer sizes: %lu RW, %lu RW", (unsigned long)bufsize, (unsigned long)buf1size);
+      applog(LOG_DEBUG, "lyra2REv2/3 buffer sizes: %lu RW, %lu RW", (unsigned long)bufsize, (unsigned long)buf1size);
       // scrypt/n-scrypt
+    }
+    else if (algorithm->type == ALGO_LYRA2Z) {
+      buf1size = 8 * 4  * 4 * cgpu->thread_concurrency; //lyra2 states
+      bufsize = 4 * 8 * cgpu->thread_concurrency;
+      // scrypt/n-scrypt
+    }
+    else if (algorithm->type == ALGO_LYRA2ZZ) {
+      buf1size = 8 * 4  * 4 * cgpu->thread_concurrency; //lyra2 states
+      bufsize = 4 * 8 * cgpu->thread_concurrency;
+      // scrypt/n-scrypt
+    }
+    else if (algorithm->type == ALGO_LYRA2H) {
+      bufsize = 4 * 8 * cgpu->thread_concurrency;
+      buf1size = LYRA2H_SCRATCHBUF_SIZE * cgpu->thread_concurrency;
     }
     else {
       size_t ipt = (algorithm->n / cgpu->lookup_gap + (algorithm->n % cgpu->lookup_gap > 0));
@@ -834,6 +932,30 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize, algorithm_t *alg
     readbufsize = 144;
 
     applog(LOG_DEBUG, "phi2 buffer sizes: %lu RW, %lu RW", (unsigned long)bufsize, (unsigned long)bufsize);
+  }
+  else if (algorithm->type == ALGO_ALLIUM) {
+    buf1size = 8 * 4  * 4 * cgpu->thread_concurrency; //lyra2 states
+    bufsize = 4 * 8 * cgpu->thread_concurrency; 
+
+    readbufsize = 144;
+
+    applog(LOG_DEBUG, "phi2 buffer sizes: %lu RW, %lu RW", (unsigned long)bufsize, (unsigned long)bufsize);
+  }
+  else if (algorithm->type == ALGO_X22I) {
+    buf4size = 8 * 4  * 4 * cgpu->thread_concurrency; //lyra2 states  // only do half lyar2v2
+    bufsize = 8 * 8 * cgpu->thread_concurrency;
+
+    applog(LOG_DEBUG, "x22i buffer sizes: %lu RW, %lu RW", (unsigned long)bufsize, (unsigned long)bufsize);
+  }
+  else if (algorithm->type == ALGO_X25X) {
+    buf4size = 8 * 4  * 4 * cgpu->thread_concurrency; //lyra2 states  // only do half lyar2v2
+    bufsize = 24 * 8 * 8 * cgpu->thread_concurrency;
+
+    applog(LOG_DEBUG, "x25x buffer sizes: %lu RW, %lu RW", (unsigned long)bufsize, (unsigned long)bufsize);
+  }
+  else if (algorithm->type == ALGO_ARGON2D) {
+    bufsize = (size_t)cgpu->throughput * AR2D_MEM_PER_BATCH;
+    readbufsize = 80;
   }
   else {
     bufsize = (size_t)algorithm->rw_buffer_size;
@@ -875,7 +997,15 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize, algorithm_t *alg
         return NULL;
       }
     }
-    else if (algorithm->type == ALGO_LYRA2REV2) {
+    else if (algorithm->type == ALGO_LYRA2REV2 || algorithm->type == ALGO_LYRA2REV3) {
+      // need additionnal buffers
+      clState->buffer1 = clCreateBuffer(clState->context, CL_MEM_READ_WRITE, buf1size, NULL, &status);
+      if (status != CL_SUCCESS && !clState->buffer1) {
+        applog(LOG_DEBUG, "Error %d: clCreateBuffer (buffer1), decrease TC or increase LG", status);
+        return NULL;
+      }
+    }
+    else if (algorithm->type == ALGO_LYRA2Z || algorithm->type == ALGO_LYRA2ZZ || algorithm->type == ALGO_ALLIUM || algorithm->type == ALGO_LYRA2H) {
       // need additionnal buffers
       clState->buffer1 = clCreateBuffer(clState->context, CL_MEM_READ_WRITE, buf1size, NULL, &status);
       if (status != CL_SUCCESS && !clState->buffer1) {
@@ -897,6 +1027,33 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize, algorithm_t *alg
       clState->buffer3 = clCreateBuffer(clState->context, CL_MEM_READ_WRITE, buf3size, NULL, &status);
       if (status != CL_SUCCESS && !clState->buffer3) {
         applog(LOG_DEBUG, "Error %d: clCreateBuffer (buffer3), decrease TC or increase LG", status);
+        return NULL;
+      }
+    } else if (algorithm->type == ALGO_X22I) {
+      clState->buffer1 = clCreateBuffer(clState->context, CL_MEM_READ_WRITE, bufsize, NULL, &status);
+      if (status != CL_SUCCESS && !clState->buffer1) {
+        applog(LOG_DEBUG, "Error %d: clCreateBuffer (buffer1), decrease TC or increase LG", status);
+        return NULL;
+      }
+      clState->buffer2 = clCreateBuffer(clState->context, CL_MEM_READ_WRITE, bufsize, NULL, &status);
+      if (status != CL_SUCCESS && !clState->buffer2) {
+        applog(LOG_DEBUG, "Error %d: clCreateBuffer (buffer2), decrease TC or increase LG", status);
+        return NULL;
+      }
+      clState->buffer3 = clCreateBuffer(clState->context, CL_MEM_READ_WRITE, bufsize, NULL, &status);
+      if (status != CL_SUCCESS && !clState->buffer3) {
+        applog(LOG_DEBUG, "Error %d: clCreateBuffer (buffer3), decrease TC or increase LG", status);
+        return NULL;
+      }
+      clState->MidstateBuf = clCreateBuffer(clState->context, CL_MEM_READ_WRITE, buf4size, NULL, &status);
+      if (status != CL_SUCCESS && !clState->MidstateBuf) {
+        applog(LOG_DEBUG, "Error %d: clCreateBuffer (MidstateBuf), decrease TC or increase LG", status);
+        return NULL;
+      }
+    } else if (algorithm->type == ALGO_X25X) {
+      clState->MidstateBuf = clCreateBuffer(clState->context, CL_MEM_READ_WRITE, buf4size, NULL, &status);
+      if (status != CL_SUCCESS && !clState->MidstateBuf) {
+        applog(LOG_DEBUG, "Error %d: clCreateBuffer (MidstateBuf), decrease TC or increase LG", status);
         return NULL;
       }
     }
@@ -924,6 +1081,8 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize, algorithm_t *alg
     applog(LOG_ERR, "Error %d: clCreateBuffer (CLbuffer0)", status);
     return NULL;
   }
+
+  clState->devid = cgpu->device_id;
 
   applog(LOG_DEBUG, "Using output buffer sized %lu", BUFFERSIZE);
   clState->outputBuffer = clCreateBuffer(clState->context, CL_MEM_WRITE_ONLY, BUFFERSIZE, NULL, &status);

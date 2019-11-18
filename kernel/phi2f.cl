@@ -3,6 +3,8 @@
  * ==========================(LICENSE BEGIN)============================
  *
  * Copyright (c) 2016 tpruvot
+ * Copyright (c) 2018 fancyIX
+ *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
  * "Software"), to deal in the Software without restriction, including
@@ -122,78 +124,142 @@ typedef union {
 
 #define WOLF_JH_64BIT 1
 
-#include "lyra2mdzf.cl"
+#include "lyra2mdzf2.cl"
 
 
 /// lyra2 algo p2 
 
-__attribute__((reqd_work_group_size(4, 5, 1)))
+__attribute__((amdgpu_waves_per_eu(1,1)))
+__attribute__((amdgpu_num_vgpr(256)))
+__attribute__((amdgpu_num_sgpr(200)))
+__attribute__((reqd_work_group_size(4, 4, 16)))
 __kernel void search2(__global uchar* sharedDataBuf)
 {
-  uint gid = get_global_id(1);
-  __global lyraState_t *lyraState = (__global lyraState_t *)(sharedDataBuf + ((8 * 4  * 4) * (gid-get_global_offset(1))));
+  uint gid = get_global_id(2);
+  __global lyraState_t *lyraState = (__global lyraState_t *)(sharedDataBuf + ((8 * 4 * 4 * 2) * (gid-get_global_offset(2))));
+  __global lyraState_t *lyraState2 = (__global lyraState_t *)(sharedDataBuf + ((8 * 4 * 4) + (8 * 4 * 4 * 2) * (gid-get_global_offset(2))));
 
-  __local ulong roundPad[12 * 5];
-  __local ulong *xchange = roundPad + get_local_id(1) * 4;
+  uint notepad[192];
 
-  //__global ulong *notepad = buffer + get_local_id(0) + 4 * SLOT;
-  __local ulong notepadLDS[192 * 4 * 5];
-  __local ulong *notepad = notepadLDS + LOCAL_LINEAR;
-  const int player = get_local_id(0);
+  const int player = get_local_id(1) % 4;
 
-  ulong state[4];
-  ulong si[3], sII[3];
+  uint state[4];
+  uint si[3];
+  uint sII[3];
+  uint s0;
+	uint s1;
+	uint s2;
+	uint s3;
+  int ss0;
+  uint ss1;
+	uint ss3;
+  uint ss;
+  uint carry;
+  const uint mindex = (LOCAL_LINEAR & 1) == 0 ? 0 : 1;
 
   //-------------------------------------
   // Load Lyra state
-  state[0] = (ulong)(lyraState->h8[player]);
-  state[1] = (ulong)(lyraState->h8[player+4]);
-  state[2] = (ulong)(lyraState->h8[player+8]);
-  state[3] = (ulong)(lyraState->h8[player+12]);
+  if (LOCAL_LINEAR == 0) state[0] = ((uint)(lyraState->h4[2 * player + 2 * 4 * 0]));
+  if (LOCAL_LINEAR == 0) state[1] = ((uint)(lyraState->h4[2 * player + 2 * 4 * 1]));
+  if (LOCAL_LINEAR == 0) state[2] = ((uint)(lyraState->h4[2 * player + 2 * 4 * 2]));
+  if (LOCAL_LINEAR == 0) state[3] = ((uint)(lyraState->h4[2 * player + 2 * 4 * 3]));
+  if (LOCAL_LINEAR == 1) state[0] = ((uint)(lyraState->h4[2 * player + 2 * 4 * 0 + 1]));
+  if (LOCAL_LINEAR == 1) state[1] = ((uint)(lyraState->h4[2 * player + 2 * 4 * 1 + 1]));
+  if (LOCAL_LINEAR == 1) state[2] = ((uint)(lyraState->h4[2 * player + 2 * 4 * 2 + 1]));
+  if (LOCAL_LINEAR == 1) state[3] = ((uint)(lyraState->h4[2 * player + 2 * 4 * 3 + 1]));
+  if (LOCAL_LINEAR == 2) state[0] = ((uint)(lyraState2->h4[2 * player + 2 * 4 * 0]));
+  if (LOCAL_LINEAR == 2) state[1] = ((uint)(lyraState2->h4[2 * player + 2 * 4 * 1]));
+  if (LOCAL_LINEAR == 2) state[2] = ((uint)(lyraState2->h4[2 * player + 2 * 4 * 2]));
+  if (LOCAL_LINEAR == 2) state[3] = ((uint)(lyraState2->h4[2 * player + 2 * 4 * 3]));
+  if (LOCAL_LINEAR == 3) state[0] = ((uint)(lyraState2->h4[2 * player + 2 * 4 * 0 + 1]));
+  if (LOCAL_LINEAR == 3) state[1] = ((uint)(lyraState2->h4[2 * player + 2 * 4 * 1 + 1]));
+  if (LOCAL_LINEAR == 3) state[2] = ((uint)(lyraState2->h4[2 * player + 2 * 4 * 2 + 1]));
+  if (LOCAL_LINEAR == 3) state[3] = ((uint)(lyraState2->h4[2 * player + 2 * 4 * 3 + 1]));
+
+  SETSGPR100101;
+
+  write_state(notepad, state, 0, 7);
+  round_lyra_4way_sw(state);
   
-  __local ulong *dst = notepad + HYPERMATRIX_COUNT;
-  //__attribute__((opencl_unroll_hint))
-  for (int loop = 0; loop < LYRA_ROUNDS; loop++) { // write columns and rows 'in order'
-    dst -= STATE_BLOCK_COUNT; // but blocks backwards
-    for(int cp = 0; cp < 3; cp++) dst[cp * REG_ROW_COUNT] = state[cp];
-    round_lyra_4way_sw(state, xchange);
-  }
-  make_hyper_one(state, xchange, notepad);
-  make_next_hyper(1, 0, 2, state, roundPad, notepad);
-  make_next_hyper(2, 1, 3, state, roundPad, notepad);
-  make_next_hyper(3, 0, 4, state, roundPad, notepad);
-  make_next_hyper(4, 3, 5, state, roundPad, notepad);
-  make_next_hyper(5, 2, 6, state, roundPad, notepad);
-  make_next_hyper(6, 1, 7, state, roundPad, notepad);
+  write_state(notepad, state, 0, 6);
+  round_lyra_4way_sw(state);
+  write_state(notepad, state, 0, 5);
+  round_lyra_4way_sw(state);
+  write_state(notepad, state, 0, 4);
+  round_lyra_4way_sw(state);
+  write_state(notepad, state, 0, 3);
+  round_lyra_4way_sw(state);
+  write_state(notepad, state, 0, 2);
+  round_lyra_4way_sw(state);
+  write_state(notepad, state, 0, 1);
+  round_lyra_4way_sw(state);
+  write_state(notepad, state, 0, 0);
+  round_lyra_4way_sw(state);
+  
+  make_hyper_one_macro(state, notepad);
+  
+  make_next_hyper_macro(1, 0, 2, state, notepad);
+  
+  make_next_hyper_macro(2, 1, 3, state, notepad);
+  make_next_hyper_macro(3, 0, 4, state, notepad);
+  make_next_hyper_macro(4, 3, 5, state, notepad);
+  make_next_hyper_macro(5, 2, 6, state, notepad);
+  make_next_hyper_macro(6, 1, 7, state, notepad);
 
-  uint modify;
+  uint modify = 0;
+  uint p0;
+  uint p1;
+  uint p2;
+  uint p3;
 
-  modify = broadcast_zero((uint)(state[0] % 8));
-  hyper_xor(7, modify, 0, state, roundPad, notepad);
-  modify = broadcast_zero((uint)(state[0] % 8));
-  hyper_xor(0, modify, 3, state, roundPad, notepad);
-  modify = broadcast_zero((uint)(state[0] % 8));
-  hyper_xor(3, modify, 6, state, roundPad, notepad);
-  modify = broadcast_zero((uint)(state[0] % 8));
-  hyper_xor(6, modify, 1, state, roundPad, notepad);
-  modify = broadcast_zero((uint)(state[0] % 8));
-  hyper_xor(1, modify, 4, state, roundPad, notepad);
-  modify = broadcast_zero((uint)(state[0] % 8));
-  hyper_xor(4, modify, 7, state, roundPad, notepad);
-  modify = broadcast_zero((uint)(state[0] % 8));
-  hyper_xor(7, modify, 2, state, roundPad, notepad);
-  modify = broadcast_zero((uint)(state[0] % 8));
-  hyper_xor(2, modify, 5, state, roundPad, notepad);
+  broadcast_zero(state);
+  hyper_xor_dpp_macro(7, modify, 0, state, notepad);
+  
+  broadcast_zero(state);
+  hyper_xor_dpp_macro(0, modify, 3, state, notepad);
+  
+  broadcast_zero(state);
+  hyper_xor_dpp_macro(3, modify, 6, state, notepad);
+  
+  broadcast_zero(state);
+  hyper_xor_dpp_macro(6, modify, 1, state, notepad);
+  broadcast_zero(state);
+  hyper_xor_dpp_macro(1, modify, 4, state, notepad);
+  broadcast_zero(state);
+  hyper_xor_dpp_macro(4, modify, 7, state, notepad);
+  broadcast_zero(state);
+  hyper_xor_dpp_macro(7, modify, 2, state, notepad);
+  broadcast_zero(state);
+  hyper_xor_dpp_macro(2, modify, 5, state, notepad);
 
-  notepad += HYPERMATRIX_COUNT * modify;
-  for(int loop = 0; loop < 3; loop++) state[loop] ^= notepad[loop * REG_ROW_COUNT];
+  state_xor_modify(modify, 0, 0, mindex, state, notepad);
+  state_xor_modify(modify, 1, 0, mindex, state, notepad);
+  state_xor_modify(modify, 2, 0, mindex, state, notepad);
+  state_xor_modify(modify, 3, 0, mindex, state, notepad);
+  state_xor_modify(modify, 4, 0, mindex, state, notepad);
+  state_xor_modify(modify, 5, 0, mindex, state, notepad);
+  state_xor_modify(modify, 6, 0, mindex, state, notepad);
+  state_xor_modify(modify, 7, 0, mindex, state, notepad);
+/**/
 
   //-------------------------------------
-  // save lyra state    
-  lyraState->h8[player] = state[0];
-  lyraState->h8[player+4] = state[1];
-  lyraState->h8[player+8] = state[2];
-  lyraState->h8[player+12] = state[3];
+  // save lyra state
+  if (LOCAL_LINEAR == 0) lyraState->h4[2 * player + 2 * 4 * 0] = state[0];
+  if (LOCAL_LINEAR == 0) lyraState->h4[2 * player + 2 * 4 * 1] = state[1];
+  if (LOCAL_LINEAR == 0) lyraState->h4[2 * player + 2 * 4 * 2] = state[2];
+  if (LOCAL_LINEAR == 0) lyraState->h4[2 * player + 2 * 4 * 3] = state[3];
+  if (LOCAL_LINEAR == 1) lyraState->h4[2 * player + 2 * 4 * 0 + 1] = state[0];
+  if (LOCAL_LINEAR == 1) lyraState->h4[2 * player + 2 * 4 * 1 + 1] = state[1];
+  if (LOCAL_LINEAR == 1) lyraState->h4[2 * player + 2 * 4 * 2 + 1] = state[2];
+  if (LOCAL_LINEAR == 1) lyraState->h4[2 * player + 2 * 4 * 3 + 1] = state[3];
+  if (LOCAL_LINEAR == 2) lyraState2->h4[2 * player + 2 * 4 * 0] = state[0];
+  if (LOCAL_LINEAR == 2) lyraState2->h4[2 * player + 2 * 4 * 1] = state[1];
+  if (LOCAL_LINEAR == 2) lyraState2->h4[2 * player + 2 * 4 * 2] = state[2];
+  if (LOCAL_LINEAR == 2) lyraState2->h4[2 * player + 2 * 4 * 3] = state[3];
+  if (LOCAL_LINEAR == 3) lyraState2->h4[2 * player + 2 * 4 * 0 + 1] = state[0];
+  if (LOCAL_LINEAR == 3) lyraState2->h4[2 * player + 2 * 4 * 1 + 1] = state[1];
+  if (LOCAL_LINEAR == 3) lyraState2->h4[2 * player + 2 * 4 * 2 + 1] = state[2];
+  if (LOCAL_LINEAR == 3) lyraState2->h4[2 * player + 2 * 4 * 3 + 1] = state[3];
 
   barrier(CLK_GLOBAL_MEM_FENCE);
 }

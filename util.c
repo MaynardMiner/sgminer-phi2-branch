@@ -15,7 +15,7 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include <string.h>
-#include <jansson.h>
+#include <bosjansson.h>
 #ifdef HAVE_LIBCURL
 #include <curl/curl.h>
 #endif
@@ -39,6 +39,7 @@
 # include <mmsystem.h>
 #endif
 
+#include "algorithm/ethash.h"
 #include "miner.h"
 #include "elist.h"
 #include "compat.h"
@@ -47,6 +48,7 @@
 
 #define DEFAULT_SOCKWAIT 60
 extern double opt_diff_mult;
+extern void suffix_string_double(double val, char *buf, size_t bufsiz, int sigdigits);
 
 bool successful_connect = false;
 static void keep_sockalive(SOCKETTYPE fd)
@@ -668,6 +670,17 @@ bool hex2bin(unsigned char *p, const char *hexstr, size_t len)
   return ret;
 }
 
+bool eth_hex2bin(unsigned char *p, const char *hexstr, size_t len)
+{
+  if (hexstr == NULL)
+    return false;
+  if (hexstr[0] == '0' && hexstr[1] == 'x')
+    hexstr += 2;
+  memset(p, 0, len);
+  len = MIN(len, (strlen(hexstr) + 1) / 2);
+  return hex2bin(p, hexstr, len);
+}
+
 bool fulltest(const unsigned char *hash, const unsigned char *target)
 {
   uint32_t *hash32 = (uint32_t *)hash;
@@ -1256,6 +1269,55 @@ enum send_ret {
 
 /* Send a single command across a socket, appending \n to it. This should all
  * be done under stratum lock except when first establishing the socket */
+static enum send_ret __stratum_send_bos(struct pool *pool, char *s, ssize_t len)
+{
+
+  SOCKETTYPE sock = pool->sock;
+  ssize_t ssent = 0;
+
+  if (opt_protocol) {
+    applog(LOG_DEBUG, "SEND: %s", s);
+  }
+  
+//  strcat(s, "\n");
+  len;
+
+  while (len > 0 ) {
+    struct timeval timeout = {1, 0};
+    ssize_t sent;
+    fd_set wd;
+retry:
+    FD_ZERO(&wd);
+    FD_SET(sock, &wd);
+    if (select(sock + 1, NULL, &wd, NULL, &timeout) < 1) {
+      if (interrupted())
+        goto retry;
+      return SEND_SELECTFAIL;
+    }
+#ifdef __APPLE__
+    sent = send(pool->sock, s + ssent, len, SO_NOSIGPIPE);
+#elif WIN32
+    sent = send(pool->sock, s + ssent, len, 0);
+#else
+    sent = send(pool->sock, s + ssent, len, MSG_NOSIGNAL);
+#endif
+    if (sent < 0) {
+      if (!sock_blocks())
+        return SEND_SENDFAIL;
+      sent = 0;
+    }
+    ssent += sent;
+    len -= sent;
+  }
+
+  pool->sgminer_pool_stats.times_sent++;
+  pool->sgminer_pool_stats.bytes_sent += ssent;
+  pool->sgminer_pool_stats.net_bytes_sent += ssent;
+  return SEND_OK;
+}
+
+/* Send a single command across a socket, appending \n to it. This should all
+ * be done under stratum lock except when first establishing the socket */
 static enum send_ret __stratum_send(struct pool *pool, char *s, ssize_t len)
 {
   SOCKETTYPE sock = pool->sock;
@@ -1330,6 +1392,35 @@ bool stratum_send(struct pool *pool, char *s, ssize_t len)
   return (ret == SEND_OK);
 }
 
+bool stratum_send_bos(struct pool *pool, char *s, ssize_t len)
+{
+	enum send_ret ret = SEND_INACTIVE;
+
+	mutex_lock(&pool->stratum_lock);
+	if (pool->stratum_active)
+		ret = __stratum_send_bos(pool, s, len);
+	mutex_unlock(&pool->stratum_lock);
+
+	/* This is to avoid doing applog under stratum_lock */
+	switch (ret) {
+	default:
+	case SEND_OK:
+		break;
+	case SEND_SELECTFAIL:
+		applog(LOG_DEBUG, "Write select failed on %s sock", get_pool_name(pool));
+		suspend_stratum(pool);
+		break;
+	case SEND_SENDFAIL:
+		applog(LOG_DEBUG, "Failed to send in stratum_send");
+		suspend_stratum(pool);
+		break;
+	case SEND_INACTIVE:
+		applog(LOG_DEBUG, "Stratum send failed due to no pool stratum_active");
+		break;
+	}
+	return (ret == SEND_OK);
+}
+
 static bool socket_full(struct pool *pool, int wait)
 {
   SOCKETTYPE sock = pool->sock;
@@ -1359,6 +1450,7 @@ bool sock_full(struct pool *pool)
 static void clear_sockbuf(struct pool *pool)
 {
   strcpy(pool->sockbuf, "");
+  pool->sockbuf_bossize = 0;
 }
 
 static void clear_sock(struct pool *pool)
@@ -1396,6 +1488,26 @@ static void recalloc_sock(struct pool *pool, size_t len)
     quithere(1, "Failed to realloc pool sockbuf");
   memset(pool->sockbuf + old, 0, newlen - old);
   pool->sockbuf_size = newlen;
+}
+
+static void recalloc_sock_bos(struct pool *pool, size_t len)
+{
+	size_t old, newlen;
+
+	old = pool->sockbuf_bossize;
+	newlen = old + len + 1;
+	if (newlen < pool->sockbuf_size)
+		return;
+	newlen = newlen + (RBUFSIZE - (newlen % RBUFSIZE));
+	// Avoid potentially recursive locking
+	// applog(LOG_DEBUG, "Recallocing pool sockbuf to %d", new);
+	
+	pool->sockbuf = (char*)realloc(pool->sockbuf, pool->sockbuf_bossize + len);
+
+	if (!pool->sockbuf)
+		quithere(1, "Failed to realloc pool sockbuf");
+
+	pool->sockbuf_size = newlen;
 }
 
 /* Peeks at a socket to find the first end of line and then reads just that
@@ -1470,6 +1582,204 @@ out:
   return sret;
 }
 
+json_t* recode_message(json_t *MyObject2)
+{
+	size_t size;
+	bool istarget = false;
+	const char *key;
+	json_t *value;
+        void *tmp;
+	json_t *MyObject = json_object();
+	json_object_foreach_safe(MyObject2, tmp, key, value) {
+/*
+		if (!strcmp(key, "method"))
+			if (!strcmp(json_string_value(value), "mining.set_target") ||
+				!strcmp(json_string_value(value), "mining.notify")
+				) {
+				istarget = false;
+			}
+*/
+
+		if (json_is_null(value))
+			json_object_set_new(MyObject, key, value); 
+
+		if (json_is_string(value)) {
+      json_object_set_new(MyObject, key, value);
+    }
+			
+		if (json_is_integer(value))
+			json_object_set_new(MyObject, key, value);
+
+		if (json_is_boolean(value))
+			json_object_set_new(MyObject, key, value);
+
+		if (json_is_array(value)) {
+			json_t *json_arr = json_array();
+			json_object_set_new(MyObject, key, json_arr);
+			size_t index;
+			json_t *value2 = NULL;
+			json_array_foreach(value, index, value2) {
+
+				if (!istarget) {
+					if (json_is_bytes(value2)) {
+						int zsize = json_bytes_size(value2);
+						unsigned char* zbyte = (unsigned char*)json_bytes_value(value2);
+						char* strval = (char*)malloc(zsize * 2 + 1);
+						for (int k = 0; k<zsize; k++)
+							sprintf(&strval[2 * k], "%02x", zbyte[k]);
+
+						json_array_append_new(json_arr, json_string(strval));
+						free(strval);
+            json_decref(value2);
+					}
+				}
+				if (json_is_string(value2)) {
+					json_array_append_new(json_arr, value2);
+				}
+				if (json_is_boolean(value2)) {
+					json_array_append_new(json_arr, value2);
+				}
+				if (json_is_array(value2)) {
+					size_t index2;
+					json_t *value3;
+					json_t *json_arr2 = json_array();
+					json_array_append_new(json_arr, json_arr2);
+					json_array_foreach(value2, index2, value3) {
+						if (!istarget) {
+							if (json_is_bytes(value3)) {
+								int zsize = json_bytes_size(value3);
+								unsigned char* zbyte = (unsigned char*)json_bytes_value(value3);
+								char* strval = (char*)malloc(zsize * 2 + 1);
+								//	  for (int k = 0; k<zsize; k++)
+								//		sprintf(&strval[2 * k], "%02x", zbyte[zsize - 1 - k]);
+								for (int k = 0; k<zsize; k++)
+									sprintf(&strval[2 * k], "%02x", zbyte[k]);
+
+								json_array_append_new(json_arr2, json_string(strval));
+								free(strval);
+								json_decref(value3);
+							}
+						}
+            //json_decref(value3);
+					}
+					//							json_t *json_arr2 = json_array();
+					//							json_array_append(json_arr, json_arr2);
+          json_decref(value2);
+				}
+        //json_decref(value2);
+			}
+      json_decref(value);
+		}
+    //json_decref(value);
+	}
+	return MyObject;
+}
+
+
+
+char *recv_line_bos(struct pool *pool)
+{
+
+	char *tok, *sret = NULL;
+	ssize_t len, buflen;
+	int waited = 0;
+	json_t *MyObject2 = NULL;
+	json_t *MyObject = NULL;
+	uint32_t bossize = 0;
+
+	bool istarget = false;
+	if (!strstr(pool->sockbuf, "\n")) {
+		struct timeval rstart, now;
+	
+		cgtime(&rstart);
+
+		if (pool->sockbuf_bossize==0)
+		if (!socket_full(pool, DEFAULT_SOCKWAIT)) {
+			applog(LOG_DEBUG, "Timed out waiting for data on socket_full");
+			goto out;
+		}
+
+		do {
+			char s[RBUFSIZE];
+			size_t slen;
+			ssize_t n;
+
+			memset(s, 0, RBUFSIZE);
+			n = recv(pool->sock, s, RECVSIZE, 0);
+		
+			if (!n) {
+		
+				applog(LOG_DEBUG, "Socket closed waiting in recv_line");
+			//	suspend_stratum(pool);
+				break;
+			}
+			cgtime(&now);
+			waited = tdiff(&now, &rstart);
+			if (n < 0) {
+			
+				if (pool->sockbuf_bossize !=0)
+					break;
+				else if (!sock_blocks() || !socket_full(pool, 5 - waited)) {
+				
+					applog(LOG_DEBUG, "Failed to recv sock in recv_line");
+					suspend_stratum(pool);
+					break;
+				}
+
+			}
+			else {
+			
+				recalloc_sock_bos(pool, n);
+				memcpy(pool->sockbuf + pool->sockbuf_bossize, s, n);
+				pool->sockbuf_bossize += n;
+			}
+		
+		} while (waited < DEFAULT_SOCKWAIT && !strstr(pool->sockbuf, "\n"));
+	}
+
+
+	len = pool->sockbuf_bossize;
+
+		json_error_t boserror;
+		if (bos_sizeof(pool->sockbuf) < pool->sockbuf_bossize) {
+			//				MyObject2 = bos_deserialize(s + bos_sizeof(s), boserror);
+			MyObject2 = bos_deserialize(pool->sockbuf, &boserror);
+		}
+		else if (bos_sizeof(pool->sockbuf) > pool->sockbuf_bossize)
+			applog(LOG_ERR, "missing something in message \n");
+		else
+			MyObject2 = bos_deserialize(pool->sockbuf, &boserror);
+		  MyObject = recode_message(MyObject2);
+      //if (MyObject2) json_decref(MyObject2);
+
+	if (bos_sizeof(pool->sockbuf)<pool->sockbuf_bossize) {
+		uint32_t totsize = pool->sockbuf_bossize;
+		uint32_t remsize = pool->sockbuf_bossize - bos_sizeof(pool->sockbuf);
+		uint32_t currsize = bos_sizeof(pool->sockbuf);
+		memmove(pool->sockbuf, pool->sockbuf + currsize, remsize);
+		pool->sockbuf_bossize = remsize;
+	}
+	else {
+		pool->sockbuf[0] = '\0';
+		pool->sockbuf_bossize = 0;
+	}
+
+
+	pool->sgminer_pool_stats.times_received++;
+	pool->sgminer_pool_stats.bytes_received += len;
+	pool->sgminer_pool_stats.net_bytes_received += len;
+out:
+	if (MyObject==NULL)
+			clear_sock(pool);
+	if (opt_protocol)
+		applog(LOG_DEBUG, "RECVD: %s", json_dumps(MyObject, 0));
+	char *ret = json_dumps(MyObject, 0);
+        
+        if (MyObject) json_decref(MyObject);
+        if (MyObject2) json_decref(MyObject2);
+        return ret;
+}
+
 /* Extracts a string value from a json array with error checking. To be used
  * when the value of the string returned is only examined and not to be stored.
  * See json_array_string below */
@@ -1501,6 +1811,7 @@ static char *json_array_string(json_t *val, unsigned int entry)
 }
 
 static char *workpadding = "000000800000000000000000000000000000000000000000000000000000000000000000000000000000000080020000";
+static char *workpadding_l2zz = "00000080000000000000000080020000";
 static char *blank_merkel = "0000000000000000000000000000000000000000000000000000000000000000";
 
 static bool parse_notify(struct pool *pool, json_t *val)
@@ -1514,11 +1825,11 @@ static bool parse_notify(struct pool *pool, json_t *val)
   int merkles, i = 0;
   json_t *arr;
 
-  bool has_roots = json_array_size(val) == 10 && pool->algorithm.type == ALGO_PHI2;
+  bool has_roots = json_array_size(val) == 10 && (pool->algorithm.type == ALGO_PHI2 || pool->algorithm.type == ALGO_LYRA2ZZ);
 
   job_id = json_array_string(val, i++);
   prev_hash = json_array_string(val, i++);
-  if (has_roots)
+  if (has_roots && pool->algorithm.type == ALGO_PHI2)
     roots = json_array_string(val, i++);
   coinbase1 = json_array_string(val, i++);
   coinbase2 = json_array_string(val, i++);
@@ -1532,6 +1843,8 @@ static bool parse_notify(struct pool *pool, json_t *val)
   nbit = json_array_string(val, i++);
   ntime = json_array_string(val, i++);
   clean = json_is_true(json_array_get(val, i));
+  if (has_roots && pool->algorithm.type == ALGO_LYRA2ZZ)
+    roots = json_array_string(val, 9);
 
   if (!job_id || !prev_hash || !coinbase1 || !coinbase2 || !bbversion || !nbit || !ntime) {
     /* Annoying but we must not leak memory */
@@ -1555,6 +1868,9 @@ static bool parse_notify(struct pool *pool, json_t *val)
   }
 
   cg_wlock(&pool->data_lock);
+  if (pool->swork.job_id!= NULL) {
+		pool->swork.prev_job_id = pool->swork.job_id;
+	}
   free(pool->swork.job_id);
   free(pool->swork.prev_hash);
   free(pool->swork.bbversion);
@@ -1616,10 +1932,10 @@ static bool parse_notify(struct pool *pool, json_t *val)
     pool->swork.nbit,
     "00000000", /* nonce */
     roots ? roots : "",
-    workpadding);
+    pool->algorithm.type == ALGO_LYRA2ZZ ? workpadding_l2zz : workpadding);
   // header_bin size is a padded multiple of 64-bytes
-  if (unlikely(!hex2bin(pool->header_bin, header, roots ? 192 : 128))) {
-    applog(LOG_WARNING, "%s: Failed to convert header to header_bin, got %s", __func__, header);
+  if (unlikely(!hex2bin(pool->header_bin, header, (roots && pool->algorithm.type == ALGO_LYRA2ZZ) ? 128 : (roots ? 192 : 128)))) {
+    applog(LOG_WARNING, "%s: Failed to convert header to header_bin, got %d, %s, %s", __func__, pool->algorithm.type == ALGO_LYRA2ZZ, roots, header);
     pool_failed(pool);
     // TODO: memory leaks? goto out, clean up there?
     return false;
@@ -1671,6 +1987,93 @@ out:
   return ret;
 }
 
+extern double le256todiff(const void *le256, double diff_multiplier);
+
+static bool parse_notify_ethash(struct pool *pool, json_t *val)
+{
+  char *job_id;
+  bool clean;
+  uint8_t EthWork[32], SeedHash[32], Target[32], NetDiff[32];
+  char *EthWorkStr, *SeedHashStr, *TgtStr, *NetDiffStr = NULL;
+  int ret = true;
+
+  job_id = json_array_string(val, 0);
+  EthWorkStr = json_array_string(val, 1);
+  SeedHashStr = json_array_string(val, 2);
+  TgtStr = json_array_string(val, 3);
+  clean = json_is_true(json_array_get(val, 4));
+  
+  if(json_array_size(val) == 6) {
+    applog(LOG_DEBUG, "Pool supports network target.");
+    NetDiffStr = json_array_string(val, 5);
+  }
+
+  if (job_id == NULL || SeedHashStr == NULL || EthWorkStr == NULL || TgtStr == NULL) {
+    applog(LOG_DEBUG, "parse_notify_ethash: Missing an array value.");
+    ret = false;
+    goto out;
+  }
+  
+  ret &= eth_hex2bin(EthWork, EthWorkStr, 32);
+  
+  ret &= eth_hex2bin(SeedHash, SeedHashStr, 32);
+  
+  ret &= eth_hex2bin(Target, TgtStr, 32);
+  
+  if (!ret || (NetDiffStr != NULL && !eth_hex2bin(NetDiff, NetDiffStr, 32))) {
+    ret = false;
+    goto out;
+  }
+  
+  cg_wlock(&pool->data_lock);
+  
+  free(pool->swork.job_id);
+  pool->swork.job_id = strdup(job_id);
+  pool->swork.clean = clean;
+ 
+  if (memcmp(pool->eth_cache.seed_hash, SeedHash, 32)) {
+    pool->eth_cache.current_epoch = EthCalcEpochNumber(SeedHash);
+    memcpy(pool->eth_cache.seed_hash, SeedHash, 32);
+    eth_gen_cache(pool);
+  }
+  memcpy(pool->EthWork, EthWork, 32);
+  
+  swab256(pool->Target, Target);
+  pool->swork.diff = le256todiff(pool->Target, pool->algorithm.diff_multiplier2);
+  suffix_string_double(pool->swork.diff, pool->diff, sizeof(pool->diff), 0);
+  
+  pool->diff1 = 0;
+  if (NetDiffStr != NULL) {
+    swab256(pool->NetDiff, NetDiff);
+    pool->diff1 = le256todiff(pool->NetDiff, pool->algorithm.diff_multiplier2);
+  }
+  pool->getwork_requested++;
+  //pool->eth_cache.disabled = false;
+  
+  cg_wunlock(&pool->data_lock);
+
+  if (opt_protocol) {
+    applog(LOG_DEBUG, "job_id: %s", job_id);
+    applog(LOG_DEBUG, "EthWork: %s", EthWorkStr);
+    applog(LOG_DEBUG, "SeedHash: %s", SeedHashStr);
+    applog(LOG_DEBUG, "Target: %s", TgtStr);
+    applog(LOG_DEBUG, "clean: %s", clean ? "yes" : "no");
+  }
+
+  /* A notify message is the closest stratum gets to a getwork */
+  total_getworks++;
+  if (pool == current_pool())
+    opt_work_update = true;
+out:
+  /* Annoying but we must not leak memory */
+  free(job_id);
+  free(SeedHashStr);
+  free(EthWorkStr);
+  free(TgtStr);
+  free(NetDiffStr);
+  return ret;
+}
+
 static bool parse_diff(struct pool *pool, json_t *val)
 {
   double old_diff, diff;
@@ -1710,8 +2113,72 @@ static bool parse_diff(struct pool *pool, json_t *val)
   return true;
 }
 
+static bool parse_target(struct pool *pool, json_t *val)
+{
+  uint8_t oldtarget[32], target[32], *str;
+
+  if ((str = (uint8_t*)json_array_string(val, 0)) == NULL) {
+    applog(LOG_DEBUG, "parse_target: Missing an array value.");
+    return false;
+  }
+
+  hex2bin(target, (const char*)str, 32);
+
+  cg_wlock(&pool->data_lock);
+  memcpy(oldtarget, pool->Target, 32);
+if (pool->algorithm.type == ALGO_MTP)
+	memcpy(pool->Target,target,32);
+else 
+  swab256(pool->Target, target);
+  cg_wunlock(&pool->data_lock);
+
+  if (memcmp(oldtarget, target, 32) != 0) {
+    applog(pool == current_pool() ? LOG_NOTICE : LOG_DEBUG, "%s target changed to %s", get_pool_name(pool), str);
+  }
+
+  if (str != NULL) {
+    free(str);
+  }
+ 
+  return true;
+}
+
+static bool parse_extranonce_ethash(struct pool *pool, json_t *val)
+{
+  char *n1str;
+
+  if (!(n1str = json_array_string(val, 0))) {
+    applog(LOG_NOTICE, "extranonce failed");
+    return false;
+  }
+  applog(LOG_NOTICE, "extranonce: %s", n1str);
+
+  cg_wlock(&pool->data_lock);
+  free(pool->nonce1);
+  pool->nonce1 = n1str;
+  pool->n1_len = strlen(n1str) / 2; //size in bytes of nonce1 in the header
+
+  free(pool->nonce1bin);
+  if (unlikely(!(pool->nonce1bin = (unsigned char *)calloc(pool->n1_len, 1)))) {
+    quithere(1, "%s: Failed to calloc pool->nonce1bin", __func__);
+  }
+
+  hex2bin(pool->nonce1bin, pool->nonce1, pool->n1_len);
+  pool->n2size = 4 - pool->n1_len; //size in bytes of nonce2 in the header
+  pool->nonce2 = 0; //reset nonce 2 to 0
+  cg_wunlock(&pool->data_lock);
+
+  applog(LOG_NOTICE, "%s extranonce set to %s", get_pool_name(pool), n1str);
+
+  return true;
+}
+
 static bool parse_extranonce(struct pool *pool, json_t *val)
 {
+  if (pool->algorithm.type == ALGO_ETHASH) {
+    return parse_extranonce_ethash(pool, val);
+  }
+
   char *nonce1;
   int n2size;
 
@@ -1844,10 +2311,14 @@ bool parse_method(struct pool *pool, char *s)
     goto done;
   }
 
-  err_val = json_object_get(val, "error");
   params = json_object_get(val, "params");
+  
+  // Ethash Stratum sends no error
+  if(pool->algorithm.type != ALGO_ETHASH)
+  {
+    err_val = json_object_get(val, "error");
 
-  if (err_val && !json_is_null(err_val)) {
+    if (err_val && !json_is_null(err_val)) {
     char *ss;
 
     if (err_val) {
@@ -1861,6 +2332,7 @@ bool parse_method(struct pool *pool, char *s)
 
     free(ss);
     goto done;
+    }
   }
 
   buf = (char *)json_string_value(method);
@@ -1869,13 +2341,14 @@ bool parse_method(struct pool *pool, char *s)
   }
 
   if (!strncasecmp(buf, "mining.notify", 13)) {
-    if (parse_notify(pool, params)) {
-      pool->stratum_notify = ret = true;
+    if (pool->algorithm.type == ALGO_ETHASH) {
+      ret = parse_notify_ethash(pool, params);
     }
     else {
-      pool->stratum_notify = ret = false;
+      ret = parse_notify(pool, params);
     }
-
+    
+    pool->stratum_notify = ret;
     goto done;
   }
 
@@ -1904,10 +2377,116 @@ bool parse_method(struct pool *pool, char *s)
     goto done;
   }
 
+  if (!strncasecmp(buf, "mining.set_target", 17) && parse_target(pool, params)) {
+    ret = true;
+    goto done;
+  }
+
 done:
-  json_decref(val);
+  json_decref(val); // TBD???
   return ret;
 }
+
+bool parse_method_bos(struct pool *pool, json_t *val)
+{
+
+
+	json_t  *method, *err_val, *params;
+	json_error_t err;
+	bool ret = false;
+	char *buf;
+/*
+	if (!s) {
+		return ret;
+	}
+*/
+	if (!val) {
+		applog(LOG_INFO, "JSON decode failed(%d)");
+		return ret;
+	}
+
+	if (!(method = json_object_get(val, "method"))) {
+		goto done;
+	}
+
+	params = json_object_get(val, "params");
+
+	// Ethash Stratum sends no error
+	if (pool->algorithm.type != ALGO_ETHASH)
+	{
+		err_val = json_object_get(val, "error");
+
+		if (err_val && !json_is_null(err_val)) {
+			char *ss;
+
+			if (err_val) {
+				ss = json_dumps(err_val, JSON_INDENT(3));
+			}
+			else {
+				ss = strdup("(unknown reason)");
+			}
+
+			applog(LOG_INFO, "JSON-RPC method decode failed: %s", ss);
+
+			free(ss);
+			goto done;
+		}
+	}
+
+	buf = (char *)json_string_value(method);
+	if (!buf) {
+		goto done;
+	}
+
+	applog(LOG_DEBUG, "We made it to parse_method()!");
+
+	if (!strncasecmp(buf, "mining.notify", 13)) {
+
+			ret = parse_notify(pool, params);
+		
+
+		pool->stratum_notify = ret;
+		goto done;
+	}
+
+	//cryptonight uses the "job" method instead of mining.notify
+
+
+	if (!strncasecmp(buf, "mining.set_difficulty", 21) && parse_diff(pool, params)) {
+		ret = true;
+		goto done;
+	}
+
+	if (!strncasecmp(buf, "mining.set_extranonce", 21) && parse_extranonce(pool, params)) {
+		ret = true;
+		goto done;
+	}
+
+	if (!strncasecmp(buf, "client.reconnect", 16) && parse_reconnect(pool, params)) {
+		ret = true;
+		goto done;
+	}
+
+	if (!strncasecmp(buf, "client.get_version", 18) && send_version(pool, val)) {
+		ret = true;
+		goto done;
+	}
+
+	if (!strncasecmp(buf, "client.show_message", 19) && show_message(pool, params)) {
+		ret = true;
+		goto done;
+	}
+
+	if (!strncasecmp(buf, "mining.set_target", 17) && parse_target(pool, params)) {
+		ret = true;
+		goto done;
+	}
+
+done:
+	json_decref(val);
+	return ret;
+}
+
 
 bool subscribe_extranonce(struct pool *pool)
 {
@@ -2040,6 +2619,81 @@ bool auth_stratum(struct pool *pool)
 out:
   json_decref(val);
   return ret;
+}
+
+bool auth_stratum_bos(struct pool *pool)
+{
+
+	json_t *val = NULL, *res_val, *err_val, *res_id, *res_job;
+	char s[RBUFSIZE], *sret = NULL;
+	json_error_t err;
+	bool ret = false;
+
+	json_t *MyObject = json_object();
+	json_t *json_arr = json_array();
+	json_object_set_new(MyObject, "id", json_integer(swork_id++));
+	json_object_set_new(MyObject, "method", json_string("mining.authorize"));
+	json_object_set_new(MyObject, "params", json_arr);
+	json_array_append_new(json_arr, json_string(pool->rpc_user));
+	json_array_append_new(json_arr, json_string(pool->rpc_pass));
+
+	json_error_t boserror;
+	bos_t *serialized = bos_serialize(MyObject, &boserror);
+	
+  json_decref(MyObject);
+	if (!stratum_send_bos(pool, (char*)serialized->data, serialized->size)) {
+    bos_free(serialized);
+    return ret;
+  }
+
+	/* Parse all data in the queue and anything left should be auth */
+	while (42) {
+		sret = recv_line_bos(pool);
+
+		if (!sret) {
+      bos_free(serialized);
+			return ret;
+		}
+		else if (parse_method(pool, sret)) {
+			free(sret);
+		}
+		else {
+			break;
+		}
+	}
+
+	val = JSON_LOADS(sret, &err);
+	free(sret);
+	res_val = json_object_get(val, "result");
+	err_val = json_object_get(val, "error");
+
+	if (!res_val || json_is_false(res_val) || (err_val && !json_is_null(err_val))) {
+		char *ss;
+
+		if (err_val)
+			ss = json_dumps(err_val, JSON_INDENT(3));
+		else
+			ss = strdup("(unknown reason)");
+		applog(LOG_INFO, "%s JSON stratum auth failed: %s", get_pool_name(pool), ss);
+		free(ss);
+
+		suspend_stratum(pool);
+
+		goto out;
+	}
+
+	//check if the result contains an id... if so then we need to process as first job
+
+
+	ret = true;
+	applog(LOG_INFO, "Stratum authorisation success for %s", get_pool_name(pool));
+	pool->probed = true;
+	successful_connect = true;
+
+out:
+	json_decref(val);
+  bos_free(serialized);
+	return ret;
 }
 
 static int recv_byte(int sockd)
@@ -2540,6 +3194,26 @@ resend:
     goto out;
   }
 
+  if(pool->algorithm.type == ALGO_ETHASH)
+  {
+    if(!pool->stratum_url) pool->stratum_url = pool->sockaddr_url;
+    
+    cg_wlock(&pool->data_lock);
+    pool->stratum_active = true;
+    pool->next_diff = 0;
+    pool->swork.diff = 1;
+    
+    pool->sessionid = NULL;
+    free(pool->nonce1);
+    pool->nonce1 = NULL;
+    pool->n1_len = 0;
+    pool->n2size = 4;
+    cg_wunlock(&pool->data_lock);
+    
+    json_decref(val);
+    return true;
+  }
+
   sessionid = get_sessionid(res_val);
   if (!sessionid)
     applog(LOG_DEBUG, "Failed to get sessionid in initiate_stratum");
@@ -2614,11 +3288,190 @@ out:
   return ret;
 }
 
+bool initiate_stratum_bos(struct pool *pool)
+{
+#define USER_AGENT PACKAGE_NAME "/" PACKAGE_VERSION
+
+	bool ret = false, recvd = false, noresume = false, sockd = false;
+	char s[RBUFSIZE], *sret = NULL, *nonce1, *sessionid;
+	json_t *val = NULL, *res_val, *err_val;
+	json_error_t err;
+	int n2size;
+	json_t *MyObject;
+	json_t *json_arr;
+resend:
+	if (!setup_stratum_socket(pool)) {
+		/* FIXME: change to LOG_DEBUG when issue #88 resolved */
+		applog(LOG_INFO, "setup_stratum_socket() on %s failed", get_pool_name(pool));
+		sockd = false;
+		goto out;
+	}
+
+	sockd = true;
+  MyObject = json_object();
+	json_arr = json_array();
+	json_object_set_new(MyObject, "id", json_integer(swork_id++));
+	json_object_set_new(MyObject, "method", json_string("mining.subscribe"));
+	json_object_set_new(MyObject, "params", json_arr);
+	if (!recvd) {
+		json_array_append_new(json_arr, json_string(USER_AGENT));
+		if (pool->sessionid)
+			json_array_append_new(json_arr, json_string(pool->sessionid));
+	} else 
+		clear_sock(pool);
+
+	json_error_t boserror;
+	bos_t *serialized = bos_serialize(MyObject, &boserror);
+
+  json_decref(MyObject);
+
+	if (__stratum_send_bos(pool, (char*)serialized->data, serialized->size) != SEND_OK) {
+	
+		applog(LOG_DEBUG, "Failed to send s in initiate_stratum");
+		goto out;
+	}
+
+	if (!socket_full(pool, DEFAULT_SOCKWAIT)) {
+		applog(LOG_DEBUG, "Timed out waiting for response in initiate_stratum");
+		goto out;
+	}
+
+	sret = recv_line_bos(pool);
+	if (!sret)
+		goto out;
+
+	recvd = true;
+
+	val = JSON_LOADS(sret, &err);
+	free(sret);
+	if (!val) {
+		applog(LOG_INFO, "JSON decode failed(%d): %s", err.line, err.text);
+		goto out;
+	}
+
+	res_val = json_object_get(val, "result");
+	err_val = json_object_get(val, "error");
+
+	if (!res_val || json_is_null(res_val) ||
+		(err_val && !json_is_null(err_val))) {
+		char *ss;
+
+		if (err_val)
+			ss = json_dumps(err_val, JSON_INDENT(3));
+		else
+			ss = strdup("(unknown reason)");
+
+		applog(LOG_INFO, "Stratum Error: %s", ss);
+
+		free(ss);
+
+		goto out;
+	}
+
+
+
+	sessionid = json_array_string(res_val, 0); //get_sessionid(res_val);
+	if (!sessionid) {
+		applog(LOG_DEBUG, "Failed to get sessionid in initiate_stratum");
+	}
+
+	nonce1 = json_array_string(res_val, 1);
+	if (!nonce1) {
+		applog(LOG_INFO, "Failed to get nonce1 in initiate_stratum");
+		free(sessionid);
+		goto out;
+	}
+
+	n2size = 8; // by default
+	if (n2size < 1)
+	{
+		applog(LOG_INFO, "Failed to get n2size in initiate_stratum");
+		free(sessionid);
+		free(nonce1);
+		goto out;
+	}
+
+	cg_wlock(&pool->data_lock);
+	free(pool->nonce1);
+	free(pool->sessionid);
+
+	pool->sessionid = sessionid;
+	pool->nonce1 = nonce1;
+	pool->n1_len = strlen(nonce1) / 2;
+
+	free(pool->nonce1bin);
+
+	pool->nonce1bin = (unsigned char *)calloc(pool->n1_len, 1);
+	if (unlikely(!pool->nonce1bin)) {
+		quithere(1, "Failed to calloc pool->nonce1bin");
+	}
+
+	hex2bin(pool->nonce1bin, pool->nonce1, pool->n1_len);
+
+	pool->n2size = n2size;
+	cg_wunlock(&pool->data_lock);
+
+	if (sessionid) {
+		applog(LOG_DEBUG, "%s stratum session id: %s", get_pool_name(pool), pool->sessionid);
+	}
+
+	ret = true;
+
+out:
+	if (ret) {
+		if (!pool->stratum_url)
+			pool->stratum_url = pool->sockaddr_url;
+		pool->stratum_active = true;
+		pool->next_diff = 0;
+		pool->swork.diff = 1;
+		pool->swork.prev_job_id = NULL;
+		pool->swork.job_id = NULL;
+		if (opt_protocol) {
+			applog(LOG_DEBUG, "%s confirmed mining.subscribe with extranonce1 %s extran2size %d",
+				get_pool_name(pool), pool->nonce1, pool->n2size);
+		}
+	}
+	else {
+		if (recvd && !noresume) {
+			/* Reset the sessionid used for stratum resuming in case the pool
+			* does not support it, or does not know how to respond to the
+			* presence of the sessionid parameter. */
+			cg_wlock(&pool->data_lock);
+			free(pool->sessionid);
+			free(pool->nonce1);
+			pool->sessionid = pool->nonce1 = NULL;
+			cg_wunlock(&pool->data_lock);
+
+			applog(LOG_DEBUG, "Failed to resume stratum, trying afresh");
+			noresume = true;
+			json_decref(val);
+			goto resend;
+		}
+		applog(LOG_DEBUG, "Initiating stratum failed on %s", get_pool_name(pool));
+		if (sockd) {
+			applog(LOG_DEBUG, "Suspending stratum on %s", get_pool_name(pool));
+			suspend_stratum(pool);
+		}
+	}
+
+  bos_free(serialized);
+	json_decref(val);
+	return ret;
+}
+
 bool restart_stratum(struct pool *pool)
 {
   applog(LOG_DEBUG, "Restarting stratum on pool %s", get_pool_name(pool));
 
+if (pool->algorithm.type == ALGO_MTP) {
   if (pool->stratum_active)
+		suspend_stratum(pool);
+	if (!initiate_stratum_bos(pool))
+		return false;
+	if (!auth_stratum_bos(pool))
+		return false;
+} else {
+    if (pool->stratum_active)
     suspend_stratum(pool);
   if (!initiate_stratum(pool))
     return false;
@@ -2626,6 +3479,7 @@ bool restart_stratum(struct pool *pool)
     return false;
   if (!auth_stratum(pool))
     return false;
+}
 
   return true;
 }

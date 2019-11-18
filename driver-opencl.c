@@ -35,6 +35,8 @@
 #include "adl.h"
 #include "util.h"
 
+#include "algorithm/argon2d/argon2d.h"
+
 /* TODO: cleanup externals ********************/
 
 #ifdef HAVE_CURSES
@@ -1035,7 +1037,7 @@ static _clState *clStates[MAX_GPUDEVICES];
 
 static void set_threads_hashes(unsigned int vectors, unsigned int compute_shaders, int64_t *hashes, size_t *globalThreads,
   unsigned int minthreads, __maybe_unused int *intensity, __maybe_unused int *xintensity,
-  __maybe_unused int *rawintensity, algorithm_t *algorithm)
+  __maybe_unused int *rawintensity, algorithm_t *algorithm, unsigned int* throughput)
 {
   unsigned int threads = 0;
   while (threads < minthreads) {
@@ -1058,6 +1060,10 @@ static void set_threads_hashes(unsigned int vectors, unsigned int compute_shader
         threads = minthreads;
       }
     }
+  }
+
+  if (algorithm->type == ALGO_ARGON2D) {
+      threads = *throughput;
   }
 
   *globalThreads = threads;
@@ -1348,8 +1354,9 @@ static bool opencl_thread_init(struct thr_info *thr)
     return false;
   }
 
-  status |= clEnqueueWriteBuffer(clState->commandQueue, clState->outputBuffer, CL_TRUE, 0,
-    buffersize, blank_res, 0, NULL, NULL);
+  if (clState != NULL)
+    status |= clEnqueueWriteBuffer(clState->commandQueue, clState->outputBuffer, CL_TRUE, 0,
+      buffersize, blank_res, 0, NULL, NULL);
   if (unlikely(status != CL_SUCCESS)) {
     free(thrdata->res);
     free(thrdata);
@@ -1412,7 +1419,7 @@ static int64_t opencl_scanhash(struct thr_info *thr, struct work *work,
   }
 
   set_threads_hashes(clState->vwidth, clState->compute_shaders, &hashes, globalThreads, localThreads[0],
-    &gpu->intensity, &gpu->xintensity, &gpu->rawintensity, &gpu->algorithm);
+    &gpu->intensity, &gpu->xintensity, &gpu->rawintensity, &gpu->algorithm, &gpu->throughput);
   if (hashes > gpu->max_hashes)
     gpu->max_hashes = hashes;
 
@@ -1425,19 +1432,36 @@ static int64_t opencl_scanhash(struct thr_info *thr, struct work *work,
   if (clState->goffset)
     p_global_work_offset = (size_t *)&work->blk.nonce;
 
+if (gpu->algorithm.type != ALGO_MTP) {
+  if (gpu->algorithm.type == ALGO_ARGON2D) {
+    const uint32_t throughput = gpu->throughput;
+	  const size_t global[] = { 16, throughput };
+	  const size_t local[] = { 16, 16 };
+	  status = clEnqueueNDRangeKernel(clState->commandQueue, clState->kernel, 2, NULL, global, local, 0, NULL, NULL);
+  } else
   status = clEnqueueNDRangeKernel(clState->commandQueue, clState->kernel, 1, p_global_work_offset,
     globalThreads, localThreads, 0, NULL, NULL);
   if (unlikely(status != CL_SUCCESS)) {
+    if (gpu->algorithm.type == ALGO_ETHASH)
+        cg_runlock(&gpu->eth_dag.lock);
     applog(LOG_ERR, "Error %d: Enqueueing kernel onto command queue. (clEnqueueNDRangeKernel)", status);
     return -1;
   }
 
   for (i = 0; i < clState->n_extra_kernels; i++) {
     if (gpu->algorithm.type == ALGO_PHI2 && i == 1) {
-      const size_t off2[] = { 0, *p_global_work_offset };
-	    const size_t gws[] = { 4, globalThreads[0] * 2 };
-	    const size_t expand[] = { 4, 5 };
-      status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 2, off2, gws, expand, 0, NULL, NULL); // lyra 4w monolithic
+      if (clState->prebuilt) {
+        const size_t off2[] = { 0, 0, *p_global_work_offset };
+	      const size_t gws[] = { 4, 4, globalThreads[0] };
+	      const size_t expand[] = { 4, 4, 16 };
+        status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 3, off2, gws, expand, 0, NULL, NULL); // lyra 4w monolithic
+      } else {
+        const size_t off2[] = { 0, *p_global_work_offset };
+	      const size_t gws[] = { 4, globalThreads[0] * 2 };
+	      const size_t expand[] = { 4, 5 };
+        status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 2, off2, gws, expand, 0, NULL, NULL); // lyra 4w monolithic
+      }
+      
     } else if (gpu->algorithm.type == ALGO_PHI2 && (i == 0 || i == 2)) {
       size_t globalThreads2[1];
       size_t localThreads2[1];
@@ -1445,18 +1469,121 @@ static int64_t opencl_scanhash(struct thr_info *thr, struct work *work,
       localThreads2[0] = localThreads[0];
       status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 1, p_global_work_offset,
         globalThreads2, localThreads2, 0, NULL, NULL);
-    } else
+    } else if (gpu->algorithm.type == ALGO_LYRA2Z && i == 1) {
+      if (clState->prebuilt) {
+        const size_t off2[] = { 0, 0, *p_global_work_offset };
+	      const size_t gws[] = { 4, 4, globalThreads[0] / 2 };
+	      const size_t expand[] = { 4, 4, 16 };
+        status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 3, off2, gws, expand, 0, NULL, NULL); // lyra 4w monolithic
+      } else {
+        const size_t off2[] = { 0, *p_global_work_offset };
+	      const size_t gws[] = { 4, globalThreads[0] };
+	      const size_t expand[] = { 4, 5 };
+        status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 2, off2, gws, expand, 0, NULL, NULL); // lyra 4w monolithic
+      }
+    } else if (gpu->algorithm.type == ALGO_LYRA2ZZ && i == 1) {
+      if (clState->prebuilt) {
+        const size_t off2[] = { 0, 0, *p_global_work_offset };
+	      const size_t gws[] = { 4, 4, globalThreads[0] / 2 };
+	      const size_t expand[] = { 4, 4, 16 };
+        status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 3, off2, gws, expand, 0, NULL, NULL); // lyra 4w monolithic
+      } else {
+        const size_t off2[] = { 0, *p_global_work_offset };
+	      const size_t gws[] = { 4, globalThreads[0] };
+	      const size_t expand[] = { 4, 5 };
+        status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 2, off2, gws, expand, 0, NULL, NULL); // lyra 4w monolithic
+      }
+    } else if (gpu->algorithm.type == ALGO_ALLIUM && (i == 2 || i == 6)) {
+      if (clState->prebuilt) {
+        const size_t off2[] = { 0, 0, *p_global_work_offset };
+	      const size_t gws[] = { 4, 4, globalThreads[0] / 2 };
+	      const size_t expand[] = { 4, 4, 16 };
+        status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 3, off2, gws, expand, 0, NULL, NULL); // lyra 4w monolithic
+      } else {
+        const size_t off2[] = { 0, *p_global_work_offset };
+	      const size_t gws[] = { 4, globalThreads[0] };
+	      const size_t expand[] = { 4, 5 };
+        status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 2, off2, gws, expand, 0, NULL, NULL); // lyra 4w monolithic
+      }
+    } else if ((gpu->algorithm.type == ALGO_X22I || gpu->algorithm.type == ALGO_X25X) && (i == 18 || i == 20)) {
+      size_t globalThreads2[1];
+      size_t localThreads2[1];
+      globalThreads2[0] = globalThreads[0] * 1; // only do half lyar2v2
+      localThreads2[0] = localThreads[0];
+      status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 1, p_global_work_offset,
+        globalThreads2, localThreads2, 0, NULL, NULL);
+    } else if ((gpu->algorithm.type == ALGO_X22I || gpu->algorithm.type == ALGO_X25X) && (i == 19)) {
+      size_t globalThreads2[1];
+      size_t localThreads2[1];
+      globalThreads2[0] = globalThreads[0] * 4; // only do half lyar2v2
+      localThreads2[0] = 64;
+      status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 1, p_global_work_offset,
+        globalThreads2, localThreads2, 0, NULL, NULL);
+    } else if ((gpu->algorithm.type == ALGO_X22I || gpu->algorithm.type == ALGO_X25X) && (i == 21)) {
+      size_t globalThreads2[1];
+      size_t localThreads2[1];
+      globalThreads2[0] = globalThreads[0];
+      localThreads2[0] = 256;
+      status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 1, p_global_work_offset,
+        globalThreads2, localThreads2, 0, NULL, NULL);
+    } else if ((gpu->algorithm.type == ALGO_X22I || gpu->algorithm.type == ALGO_X25X) && (i == 15)) {
+      const size_t off2[] = { 0, *p_global_work_offset };
+	    const size_t gws[] = { 8, globalThreads[0] };
+	    const size_t expand[] = { 8, 32 };
+      status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 2, off2, gws, expand, 0, NULL, NULL); // lyra 4w monolithic
+    } else if (gpu->algorithm.type == ALGO_X25X && (i == 25)) {
+      size_t globalThreads2[1];
+      size_t localThreads2[1];
+      globalThreads2[0] = globalThreads[0];
+      localThreads2[0] = 21;
+      status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 1, p_global_work_offset,
+        globalThreads2, localThreads2, 0, NULL, NULL);
+    } else if (gpu->algorithm.type == ALGO_LYRA2REV2 && (i == 3)) {
+      size_t globalThreads2[1];
+      size_t localThreads2[1];
+      globalThreads2[0] = globalThreads[0] * 4;
+      localThreads2[0] = 64;
+      status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 1, p_global_work_offset,
+        globalThreads2, localThreads2, 0, NULL, NULL);
+    } else if (gpu->algorithm.type == ALGO_LYRA2REV3 && (i == 1 || i == 5)) {
+      size_t globalThreads2[1];
+      size_t localThreads2[1];
+      globalThreads2[0] = globalThreads[0] * 4;
+      localThreads2[0] = 64;
+      status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 1, p_global_work_offset,
+        globalThreads2, localThreads2, 0, NULL, NULL);
+    } else if (gpu->algorithm.type == ALGO_ARGON2D && i == 0) {
+      if (clState->prebuilt) {
+        const uint32_t throughput = gpu->throughput;
+        const size_t global2[] = { 32, 8, throughput };
+	      const size_t local2[] = { 32, 8, 1 };
+	      status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 3, NULL, global2, local2, 0, NULL, NULL);
+      } else {
+        const uint32_t throughput = gpu->throughput;
+        const size_t global2[] = { 32 * 8, throughput };
+	      const size_t local2[] = { 32 * 8, 1 };
+	      status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 2, NULL, global2, local2, 0, NULL, NULL);
+      }
+    } else if (gpu->algorithm.type == ALGO_ARGON2D && i == 1) {
+      const uint32_t throughput = gpu->throughput;
+      const size_t global3[] = { 4, throughput };
+	    const size_t local3[] = { 4, 8 };
+	    status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 2, NULL, global3, local3, 0, NULL, NULL);
+    }
+    else
       status = clEnqueueNDRangeKernel(clState->commandQueue, clState->extra_kernels[i], 1, p_global_work_offset,
         globalThreads, localThreads, 0, NULL, NULL);
     if (unlikely(status != CL_SUCCESS)) {
-      applog(LOG_ERR, "Error %d: Enqueueing kernel onto command queue. (clEnqueueNDRangeKernel)", status);
+      applog(LOG_ERR, "Error %d: Enqueueing kernel search%d onto command queue. (clEnqueueNDRangeKernel)", status, i + 1);
       return -1;
     }
   }
-
+}
   status = clEnqueueReadBuffer(clState->commandQueue, clState->outputBuffer, CL_FALSE, 0,
     buffersize, thrdata->res, 0, NULL, NULL);
   if (unlikely(status != CL_SUCCESS)) {
+    if (gpu->algorithm.type == ALGO_ETHASH)
+      cg_runlock(&gpu->eth_dag.lock);
     applog(LOG_ERR, "Error: clEnqueueReadBuffer failed error %d. (clEnqueueReadBuffer)", status);
     return -1;
   }
@@ -1468,6 +1595,8 @@ static int64_t opencl_scanhash(struct thr_info *thr, struct work *work,
 
   /* This finish flushes the readbuffer set with CL_FALSE in clEnqueueReadBuffer */
   clFinish(clState->commandQueue);
+  if (gpu->algorithm.type == ALGO_ETHASH)
+    cg_runlock(&gpu->eth_dag.lock);
 
   /* found entry is used as a counter to say how many nonces exist */
   if (thrdata->res[found]) {
@@ -1510,9 +1639,18 @@ static void opencl_thread_shutdown(struct thr_info *thr)
 	clReleaseMemObject(clState->buffer2);
 	if (clState->buffer3)
 	clReleaseMemObject(clState->buffer3);
+  if (clState->MidstateBuf)
+	clReleaseMemObject(clState->MidstateBuf);
+  if (clState->MatrixBuf)
+	clReleaseMemObject(clState->MatrixBuf);
     if (clState->padbuffer8)
       clReleaseMemObject(clState->padbuffer8);
     clReleaseKernel(clState->kernel);
+  if (clState->GenerateDAG) {
+    clReleaseKernel(clState->GenerateDAG);
+  }
+  if (thr->cgpu->eth_dag.dag_buffer)
+	  clReleaseMemObject(thr->cgpu->eth_dag.dag_buffer);
     for (i = 0; i < clState->n_extra_kernels; i++)
       clReleaseKernel(clState->extra_kernels[i]);
     clReleaseProgram(clState->program);

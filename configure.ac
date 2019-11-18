@@ -1,9 +1,9 @@
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
-m4_define([v_maj], [5])
+m4_define([v_maj], [0])
 m4_define([v_min], [6])
-m4_define([v_mic], [1])
-m4_define([v_rev], [nicehash])
+m4_define([v_mic], [0])
+m4_define([v_rev], [1])
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 m4_ifdef([v_rev], [m4_define([v_ver], [v_maj.v_min.v_mic-v_rev])], [m4_define([v_ver], [v_maj.v_min.v_mic])])
 m4_define([lt_rev], m4_eval(v_maj + v_min))
@@ -49,6 +49,7 @@ AM_MAINTAINER_MODE
 
 dnl Checks for programs
 AC_PROG_CC
+AC_PROG_CXX
 gl_EARLY
 AC_PROG_GCC_TRADITIONAL
 AM_PROG_CC_C_O
@@ -254,7 +255,7 @@ AM_CONDITIONAL([HAVE_WINDOWS], [test x$have_win32 = xtrue])
 AM_CONDITIONAL([HAVE_x86_64], [test x$have_x86_64 = xtrue])
 
 AC_CONFIG_SUBDIRS([submodules/jansson])
-JANSSON_LIBS="submodules/jansson/src/.libs/libjansson.a"
+JANSSON_LIBS="submodules/jansson/src/.libs/libbosjansson.a"
 
 PKG_PROG_PKG_CONFIG()
 
@@ -379,6 +380,7 @@ AC_CONFIG_FILES([
 	ccan/Makefile
 	lib/Makefile
 	sph/Makefile
+	SWIFFTX/Makefile
 	])
 AC_OUTPUT
 

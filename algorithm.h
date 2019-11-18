@@ -12,7 +12,9 @@
 #include "ocl/build_kernel.h"   // For the build_kernel_data type
 
 typedef enum {
+  ALGO_MTP,
   ALGO_UNK,
+  ALGO_ALLIUM,
   ALGO_CRE,
   ALGO_SCRYPT,
   ALGO_NSCRYPT,
@@ -21,6 +23,8 @@ typedef enum {
   ALGO_X13,
   ALGO_X14,
   ALGO_X15,
+  ALGO_X22I,
+  ALGO_X25X,
   ALGO_KECCAK,
   ALGO_QUARK,
   ALGO_TWE,
@@ -32,6 +36,10 @@ typedef enum {
   ALGO_WHIRLPOOLX,
   ALGO_LYRA2RE,
   ALGO_LYRA2REV2,
+  ALGO_LYRA2REV3,
+  ALGO_LYRA2Z,
+  ALGO_LYRA2ZZ,
+  ALGO_LYRA2H,
   ALGO_PLUCK,
   ALGO_YESCRYPT,
   ALGO_YESCRYPT_MULTI,
@@ -40,10 +48,12 @@ typedef enum {
   ALGO_SIA,
   ALGO_DECRED,
   ALGO_VANILLA,
+  ALGO_ETHASH,
   ALGO_LBRY,
   ALGO_PHI,
   ALGO_PHI2,
-  ALGO_SIBCOIN 
+  ALGO_SIBCOIN,
+  ALGO_ARGON2D
 } algorithm_type_t;
 
 extern const char *algorithm_type_str[];
